@@ -149,15 +149,52 @@ const paidHandler = PAYMENT_ENABLED
     )
   : null;
 
+// MCP methods that are always FREE (discovery / handshake).
+const FREE_METHODS = new Set([
+  "initialize",
+  "initialized",
+  "notifications/initialized",
+  "tools/list",
+  "ping",
+]);
+
+function rpcRespond(body: unknown): NextResponse {
+  if (Array.isArray(body)) {
+    const responses = (body as JsonRpcRequest[])
+      .map((entry) => handleJsonRpc(entry))
+      .filter((r) => r.result !== undefined || r.error !== undefined);
+    return NextResponse.json(responses);
+  }
+  return NextResponse.json(handleJsonRpc(body as JsonRpcRequest));
+}
+
 export async function POST(request: NextRequest): Promise<NextResponse> {
-  if (paidHandler) {
-    return paidHandler(request);
+  // ── 1. Parse the JSON-RPC body once ──────────────────────────────────────
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json(
+      {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32700, message: "Parse error: invalid JSON" },
+      },
+      { status: 400 },
+    );
   }
 
-  // ─── Standalone x402 mode ────────────────────────────────────────────────
-  // No facilitator creds → enforce 402 challenge manually.
-  // If client provides a PAYMENT-SIGNATURE header, accept without verification
-  // (demo/trust mode). Otherwise return a proper x402 v2 402 challenge.
+  // ── 2. Free MCP discovery methods — no x402 payment required ─────────────
+  const method = Array.isArray(body)
+    ? (body[0] as JsonRpcRequest)?.method
+    : (body as JsonRpcRequest)?.method;
+
+  if (typeof method === "string" && FREE_METHODS.has(method)) {
+    return rpcRespond(body);
+  }
+
+  // ── 3. Paid resource: tools/call requires x402 payment ───────────────────
+  // Standalone x402 mode: manual 402 challenge + trust-mode accept.
   const paymentSignature = request.headers.get("PAYMENT-SIGNATURE");
 
   if (!paymentSignature) {
@@ -171,7 +208,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   }
 
   // Payment proof present → process the request (trust mode)
-  const response = await mcpHandler(request);
+  const response = rpcRespond(body);
   response.headers.set("X-NarrativeRadar-Payment", "standalone-trust-mode");
   return response;
 }
